@@ -1,10 +1,12 @@
 import torch 
 import torch.nn.functional as F
 from torch.autograd import Variable
+import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence
 from torch.nn.utils.rnn import pad_packed_sequence
 import numpy as np
 from utils import cc 
+from utils import gumbel_softmax
 
 def _get_vgg2l_odim(idim, in_channel=1, out_channel=128):
     idim = idim / in_channel
@@ -47,31 +49,6 @@ class VGG2L(torch.nn.Module):
         xs = xs.contiguous().view(xs.size(0), xs.size(1), xs.size(2) * xs.size(3))
         return xs, ilens
 
-#class pBLSTMLayer(torch.nn.Module):
-#    def __init__(self, input_dim, hidden_dim, subsample, dropout_rate):
-#        super(pBLSTMLayer, self).__init__()
-#        self.subsample = subsample
-#        if subsample > 0:
-#            self.BLSTM = torch.nn.LSTM(input_dim*2, hidden_dim, 1, bidirectional=True,
-#                    dropout=dropout_rate, batch_first=True)
-#        else:
-#            self.BLSTM = torch.nn.LSTM(input_dim, hidden_dim, 1, bidirectional=True,
-#                    dropout=dropout_rate, batch_first=True)
-#
-#    def forward(self, x):
-#        # x = [batch_size, frames, feature_dim]
-#        batch_size = x.size(0)
-#        timesteps = x.size(1)
-#        input_dim = x.size(2)
-#        if self.subsample > 0 and timesteps % 2 == 0:
-#            x = x.contiguous().view(batch_size, timesteps//2, input_dim*2)
-#        elif self.subsample > 0:
-#            # pad one frame
-#            x = _pad_one_frame(x)
-#            x = x.contiguous().view(batch_size, timesteps//2+1, input_dim*2)
-#        output, hidden = self.BLSTM(x)
-#        return output, hidden
-
 class pBLSTM(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, n_layers, subsample, dropout_rate):
         super(pBLSTM, self).__init__()
@@ -100,17 +77,36 @@ class pBLSTM(torch.nn.Module):
         return xpad, ilens
 
 class Encoder(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_layers, subsample, dropout_rate, in_channel=1):
+    def __init__(self, input_dim, hidden_dim, n_layers, subsample, dropout_rate, output_dim, in_channel=1):
         super(Encoder, self).__init__()
         self.enc1 = VGG2L(in_channel)
         out_channel = _get_vgg2l_odim(input_dim) 
         self.enc2 = pBLSTM(input_dim=out_channel, hidden_dim=hidden_dim, n_layers=n_layers, 
                 subsample=subsample, dropout_rate=dropout_rate)
+        self.linear = nn.Linear(hidden_dim * 2, output_dim)
 
-    def forward(self, x, ilens):
+    def forward(self, x, ilens, temperature=1.0):
         out, ilens = self.enc1(x, ilens)
         out, ilens = self.enc2(out, ilens)
+        out = self.linear(out)
         return out, ilens
+
+class EmbeddingLayer(torch.nn.Module):
+    def __init__(self, embedding_dim, n_latent):
+        super(EmbeddingLayer, self).__init__()
+        self.embedding = torch.nn.Linear(n_latent, embedding_dim, bias=False)
+
+    def forward(self, query, temperature=1.):
+        '''
+        query: batch_size x timestep x embedding_dim
+        embedding: n_latent x embedding_dim
+        '''
+        unnormalized_logits = query @ self.embedding.weight
+        unnormalized_logits = unnormalized_logits / torch.norm(query, p=2, dim=-1, keepdim=True)
+        logits = unnormalized_logits / torch.norm(torch.t(self.embedding.weight), p=2, dim=-1)
+        proba = gumbel_softmax(logits, temperature=temperature)
+        output = self.embedding(proba)
+        return proba, output
 
 class AttLoc(torch.nn.Module):
     def __init__(self, encoder_dim, decoder_dim, att_dim, conv_channels, conv_kernel_size):
@@ -172,18 +168,26 @@ class AttLoc(torch.nn.Module):
         return c, w 
 
 class Decoder(torch.nn.Module):
-    def __init__(self, output_dim, hidden_dim, encoder_dim, att_dim, bos, eos):
-        self.bos, self.eos = bos, eos
-        self.emb = torch.nn.Embedding(output_dim, hidden_dim)
-        self.LSTM = torch.nn.LSTMCell(encoder_dim + hidden_dim, hidden_dim)
+    def __init__(self, input_dim, embedding_dim, encoder_dim, att_dim, hidden_dim, output_dim):
+        # index 0 is padding, index 1 is GO symbol 
+        self.input_layer = torch.nn.Linear(input_dim + 2, embedding_dim)
+        self.rnn_cell = torch.nn.LSTMCell(embedding_dim + encoder_dim, hidden_dim)
         self.output_layer = torch.nn.Linear(hidden_dim, output_dim)
+        self.attention = AttLoc(encoder_dim=encoder_dim, decoder_dim=hidden_dim, 
+                att_dim=att_dim, conv_channels=100, conv_kernel_size=10)
+
+    def forward_step(self, token, last_hidden_state, encoder_state):
+        self.rnn_cell()
 
 if __name__ == '__main__':
     data = cc(torch.randn(32, 321, 13))
     ilens = np.ones((32,), dtype=np.int64) * 121
-    net = cc(Encoder(13, 320, 4, [1, 2, 2, 1], dropout_rate=0.3))
-    output, ilens = net(data, ilens)
-    print(output.size())
+    net = cc(Encoder(13, 320, 4, [1, 2, 2, 1], dropout_rate=0.3, output_dim=512))
+    emb = cc(EmbeddingLayer(embedding_dim=512, n_latent=300))
+    out, ilens = net(data, ilens)
+    print(out.size())
+    distr, out = emb(out)
+    print(distr.size(), out.size())
     #att = cc(AttLoc(640, 320, 300, 100, 10))
     #att.reset()
     #dec = cc(Variable(torch.randn(32, 320)))
